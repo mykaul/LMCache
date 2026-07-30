@@ -5,8 +5,10 @@ Base classes for health monitoring.
 
 # Standard
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Union
+import enum
 import threading
+import time
 
 # First Party
 from lmcache.logging import init_logger
@@ -141,6 +143,122 @@ class HealthCheck(ABC):
                               Return empty list if the check is not applicable.
         """
         pass
+
+
+def resolve_fallback_policy(
+    fallback_policy_value: Union[str, FallbackPolicy], context: str
+) -> FallbackPolicy:
+    """
+    Resolve a raw ``fallback_policy`` config value into a ``FallbackPolicy``.
+
+    Shared by health checks (e.g. ``RemoteBackendHealthCheck``,
+    ``ScyllaBackendHealthCheck``) that read their fallback policy from
+    ``backend.config.get_extra_config_value(FALLBACK_POLICY_CONFIG_KEY, ...)``,
+    which may already be a ``FallbackPolicy`` (set programmatically) or a
+    plain string (set via config file/CLI).
+
+    :param fallback_policy_value: The raw config value: a ``FallbackPolicy``
+        or a string naming one of its members.
+    :param context: A short label (e.g. the backend's ``repr``) included in
+        the warning logged when *fallback_policy_value* is an invalid string.
+    :return: The resolved ``FallbackPolicy``, or ``DEFAULT_FALLBACK_POLICY``
+        if *fallback_policy_value* is an invalid string or an unexpected type.
+    """
+    if isinstance(fallback_policy_value, FallbackPolicy):
+        return fallback_policy_value
+    if isinstance(fallback_policy_value, str):
+        try:
+            return FallbackPolicy(fallback_policy_value)
+        except ValueError:
+            logger.warning(
+                "Invalid fallback_policy '%s' for %s, using default: %s",
+                fallback_policy_value,
+                context,
+                DEFAULT_FALLBACK_POLICY,
+            )
+            return DEFAULT_FALLBACK_POLICY
+    return DEFAULT_FALLBACK_POLICY
+
+
+class FailureCheckResult(enum.Enum):
+    """Outcome of :meth:`GetBlockingFailureTracker.evaluate`."""
+
+    #: The caller's health check should report unhealthy for this call.
+    UNHEALTHY = "unhealthy"
+    #: No ``get_blocking``-failure verdict yet; the caller should proceed
+    #: with its own further checks (e.g. a ping).
+    CONTINUE = "continue"
+
+
+class GetBlockingFailureTracker:
+    """
+    Shared bookkeeping for health checks that gate health on a backend's
+    accumulated ``get_blocking`` failure count plus a recovery window.
+
+    Encapsulates the policy shared by ``RemoteBackendHealthCheck`` and
+    ``ScyllaBackendHealthCheck``: once ``threshold`` or more ``get_blocking``
+    failures are observed within one check interval, the backend is reported
+    unhealthy for at least ``waiting_time_for_recovery`` seconds, after which
+    a caller-supplied recovery probe (e.g. a put+get round trip, or a ping)
+    determines whether to resume normal health reporting.
+    """
+
+    def __init__(self) -> None:
+        self._failure_time: Optional[float] = None
+        self._last_get_blocking_failed_count = 0
+
+    def evaluate(
+        self,
+        current_failed_count: int,
+        threshold: int,
+        waiting_time_for_recovery: float,
+        recovery_probe: Callable[[], bool],
+    ) -> FailureCheckResult:
+        """
+        Update failure bookkeeping and decide whether the caller's health
+        check should report unhealthy on account of ``get_blocking``
+        failures.
+
+        :param current_failed_count: The backend's cumulative
+            ``get_blocking_failed_count`` as observed right now.
+        :param threshold: Number of failures within one interval at or
+            above which the backend is considered unhealthy.
+        :param waiting_time_for_recovery: Minimum seconds to wait after
+            ``failure_time`` before invoking *recovery_probe*.
+        :param recovery_probe: Zero-argument callable returning ``True`` if
+            the backend appears to have recovered. Only invoked once
+            *waiting_time_for_recovery* has elapsed since ``failure_time``.
+        :return: :attr:`FailureCheckResult.UNHEALTHY` if the caller's health
+            check should report unhealthy for this call;
+            :attr:`FailureCheckResult.CONTINUE` if the caller should proceed
+            with its own further checks (e.g. a ping).
+        """
+        if self._failure_time is not None:
+            if (
+                time.time() - self._failure_time > waiting_time_for_recovery
+                and recovery_probe()
+            ):
+                logger.info("Recovered from get_blocking failures.")
+                self._failure_time = None
+            else:
+                logger.info(
+                    "Still in get_blocking failure recovery window "
+                    "(failure_time=%s).",
+                    self._failure_time,
+                )
+                return FailureCheckResult.UNHEALTHY
+
+        delta = current_failed_count - self._last_get_blocking_failed_count
+        self._last_get_blocking_failed_count = current_failed_count
+        if delta >= threshold:
+            logger.warning(
+                "Detected %s get_blocking failures in interval, threshold: %s",
+                delta,
+                threshold,
+            )
+            self._failure_time = time.time()
+            return FailureCheckResult.UNHEALTHY
+        return FailureCheckResult.CONTINUE
 
 
 class HealthMonitor(PeriodicThread):

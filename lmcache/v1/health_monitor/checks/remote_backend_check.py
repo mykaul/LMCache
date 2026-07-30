@@ -16,7 +16,12 @@ import torch
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor
 from lmcache.utils import CacheEngineKey
-from lmcache.v1.health_monitor.base import HealthCheck
+from lmcache.v1.health_monitor.base import (
+    FailureCheckResult,
+    GetBlockingFailureTracker,
+    HealthCheck,
+    resolve_fallback_policy,
+)
 from lmcache.v1.health_monitor.constants import (
     DEFAULT_FALLBACK_POLICY,
     DEFAULT_GET_BLOCKING_FAILED_THRESHOLD,
@@ -60,26 +65,15 @@ class RemoteBackendHealthCheck(HealthCheck):
     ):
         self.backend = backend
         # Get fallback policy from config
-        fallback_policy_str = backend.config.get_extra_config_value(
+        fallback_policy_value = backend.config.get_extra_config_value(
             FALLBACK_POLICY_CONFIG_KEY, DEFAULT_FALLBACK_POLICY.value
         )
-        # Convert string to FallbackPolicy enum
-        if isinstance(fallback_policy_str, str):
-            try:
-                self._fallback_policy = FallbackPolicy(fallback_policy_str)
-            except ValueError:
-                logger.warning(
-                    f"Invalid fallback_policy '{fallback_policy_str}' "
-                    f"for {backend}, using default: "
-                    f"{DEFAULT_FALLBACK_POLICY}"
-                )
-                self._fallback_policy = DEFAULT_FALLBACK_POLICY
-        elif isinstance(fallback_policy_str, FallbackPolicy):
-            self._fallback_policy = fallback_policy_str
-        self.failure_time: Optional[float] = None
+        self._fallback_policy = resolve_fallback_policy(
+            fallback_policy_value, context=str(backend)
+        )
+        self._failure_tracker = GetBlockingFailureTracker()
         self._stats_monitor = LMCStatsMonitor.GetOrCreate()
         self._backend_name: Optional[str] = None
-        self._last_get_blocking_failed_count = 0
 
     @classmethod
     def create(cls, manager: "LMCacheManager") -> List[HealthCheck]:
@@ -175,49 +169,19 @@ class RemoteBackendHealthCheck(HealthCheck):
         connector = self.backend.connection
         assert connector is not None
 
-        if self.failure_time is not None:
-            waiting_time = self.backend.config.get_extra_config_value(
+        failure_check = self._failure_tracker.evaluate(
+            current_failed_count=self.backend.get_blocking_failed_count,
+            threshold=self.backend.config.get_extra_config_value(
+                GET_BLOCKING_FAILED_THRESHOLD_CONFIG_KEY,
+                DEFAULT_GET_BLOCKING_FAILED_THRESHOLD,
+            ),
+            waiting_time_for_recovery=self.backend.config.get_extra_config_value(
                 WAITING_TIME_FOR_RECOVERY_CONFIG_KEY,
                 DEFAULT_WAITING_TIME_FOR_RECOVERY,
-            )
-            if (
-                time.time() - self.failure_time > waiting_time
-                and self._put_and_get_check()
-            ):
-                # recover from get blocking failed
-                logger.info(
-                    "Failure time: %s, current time: %s, "
-                    "recover from get blocking failed",
-                    self.failure_time,
-                    time.time(),
-                )
-                self.failure_time = None
-            else:
-                logger.info(
-                    "Failure time: %s, current time: %s, "
-                    "still in get blocking failed recovery window",
-                    self.failure_time,
-                    time.time(),
-                )
-                return False
-
-        # Check read failed
-        current_get_blocking_failed_count = self.backend.get_blocking_failed_count
-        get_blocking_failed_count = (
-            current_get_blocking_failed_count - self._last_get_blocking_failed_count
+            ),
+            recovery_probe=self._put_and_get_check,
         )
-        self._last_get_blocking_failed_count = current_get_blocking_failed_count
-        threshold = self.backend.config.get_extra_config_value(
-            GET_BLOCKING_FAILED_THRESHOLD_CONFIG_KEY,
-            DEFAULT_GET_BLOCKING_FAILED_THRESHOLD,
-        )
-        if get_blocking_failed_count >= threshold:
-            logger.warning(
-                "Detected %s get blocking failed in interval, threshold: %s",
-                get_blocking_failed_count,
-                threshold,
-            )
-            self.failure_time = time.time()
+        if failure_check is FailureCheckResult.UNHEALTHY:
             return False
 
         # If connector doesn't support ping, assume it's healthy
