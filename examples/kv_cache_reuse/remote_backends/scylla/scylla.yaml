@@ -1,0 +1,15 @@
+local_cpu: true
+max_local_cpu_size: 10.0
+
+storage_plugins: ["scylla"]
+extra_config:
+  storage_plugin.scylla.module_path: lmcache.v1.storage_backend.scylla_backend
+  storage_plugin.scylla.class_name: ScyllaDBBackend
+
+  scylla:
+    contact_points: ["127.0.0.1"]
+    port: 9042
+    keyspace: "lmcache"
+    local_dc: "datacenter1"
+    ttl_seconds: 86400
+    table_compression: "LZ4WithDictsCompressor"

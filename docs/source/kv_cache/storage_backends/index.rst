@@ -33,6 +33,7 @@ Supported Backends
    resp
    s3
    sagemaker_hyperpod
+   scylla
    valkey
    weka
    3fs

@@ -242,8 +242,7 @@ class GetBlockingFailureTracker:
                 self._failure_time = None
             else:
                 logger.info(
-                    "Still in get_blocking failure recovery window "
-                    "(failure_time=%s).",
+                    "Still in get_blocking failure recovery window (failure_time=%s).",
                     self._failure_time,
                 )
                 return FailureCheckResult.UNHEALTHY

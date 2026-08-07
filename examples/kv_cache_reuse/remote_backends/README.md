@@ -5,4 +5,5 @@ We have examples for the following backends:
 
 - Infinistore: `infinistore/`
 - Mooncake: `mooncakestore/`
+- ScyllaDB: `scylla/`
 - External: `external/`

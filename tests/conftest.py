@@ -784,7 +784,15 @@ def autorelease_v1(request):
 @pytest.fixture(scope="session")
 def memory_allocator():
     """One MixedMemoryAllocator (5GB) for the whole test session;
-    .close() is a no-op per-test."""
+    .close() is a no-op per-test.
+
+    TODO(https://github.com/LMCache/LMCache/issues/4295): this fixture is
+    instantiated (eagerly pinning ~5GB / ~9GB RSS) for every pytest session
+    that runs any test in this repo, even sessions where no test actually
+    uses the shared allocator, because `use_shared_allocator` below declares
+    it as a fixture parameter before checking the `no_shared_allocator`
+    marker. Needs to be made lazy and/or right-sized.
+    """
     _real = MixedMemoryAllocator(5 * 1024 * 1024 * 1024)  # 5GB
 
     class _NoCloseWrapper:
