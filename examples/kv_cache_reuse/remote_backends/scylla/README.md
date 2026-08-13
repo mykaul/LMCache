@@ -8,11 +8,10 @@ for how it's laid out.
 
 ## Quick Start
 
-1. Install the driver:
-
-   ```bash
-   pip install scylla-driver
-   ```
+1. Install the driver. `python-rs-driver` (package `scylla`) is not yet on
+   PyPI; build it from
+   [scylladb/python-rs-driver](https://github.com/scylladb/python-rs-driver)
+   with `maturin`.
 
 2. Start a local, disposable ScyllaDB cluster (RAM-backed, resource-capped --
    for local testing, not production):
@@ -62,4 +61,4 @@ against the ScyllaDB backend.
 - [ScyllaDB documentation](https://www.scylladb.com/product/technology/)
 - [Full ScyllaDB backend configuration reference](../../../../docs/source/kv_cache/storage_backends/scylla.rst)
   (all config keys, health monitoring, limitations, troubleshooting)
-- [scylla-driver (Python driver) on GitHub](https://github.com/scylladb/python-driver)
+- [python-rs-driver on GitHub](https://github.com/scylladb/python-rs-driver)

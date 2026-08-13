@@ -11,18 +11,90 @@ backend's connectivity itself (covered by test_scylla_backend*.py).
 
 # Standard
 from unittest.mock import MagicMock
+import sys
 import time
+import types
 
 # Third Party
 import pytest
 
+# Stub the scylla (python-rs-driver) package BEFORE importing scylla_backend.
+# Whichever test module imports scylla_backend first in a given pytest
+# process determines _SCYLLA_AVAILABLE for the rest of it (module-level
+# imports only execute once) -- if this file ran first without stubbing,
+# scylla_backend would see no driver installed, bind none of its driver
+# symbols, and every other scylla test file's patch() targets (e.g.
+# "scylla_backend.SessionBuilder") would fail with AttributeError. Mirrors
+# tests/v1/storage_backend/test_scylla_backend.py's stubbing so import
+# order across the test suite doesn't matter. This file's own tests never
+# touch the driver directly (they mock ScyllaDBBackend itself), so the
+# stub contents are irrelevant here -- only their presence matters.
+if "scylla" not in sys.modules:
+    for _name in [
+        "scylla",
+        "scylla.enums",
+        "scylla.errors",
+        "scylla.execution_profile",
+        "scylla.policies",
+        "scylla.policies.load_balancing",
+        "scylla.session",
+        "scylla.session_builder",
+        "scylla.statement",
+    ]:
+        sys.modules[_name] = types.ModuleType(_name)
+    sys.modules["scylla"].enums = sys.modules["scylla.enums"]
+    sys.modules["scylla"].errors = sys.modules["scylla.errors"]
+    sys.modules["scylla"].execution_profile = sys.modules["scylla.execution_profile"]
+    sys.modules["scylla"].policies = sys.modules["scylla.policies"]
+    sys.modules["scylla.policies"].load_balancing = sys.modules[
+        "scylla.policies.load_balancing"
+    ]
+    sys.modules["scylla"].session = sys.modules["scylla.session"]
+    sys.modules["scylla"].session_builder = sys.modules["scylla.session_builder"]
+    sys.modules["scylla"].statement = sys.modules["scylla.statement"]
+    sys.modules["scylla.enums"].Consistency = type(
+        "MockConsistency", (), {"LocalOne": 1, "Quorum": 2, "All": 3}
+    )
+    sys.modules["scylla.enums"].Compression = type(
+        "MockCompression", (), {"Lz4": 1, "Snappy": 2}
+    )
+    sys.modules["scylla.errors"].ExecuteError = type(
+        "MockExecuteError", (Exception,), {}
+    )
+    sys.modules["scylla.errors"].PrepareError = type(
+        "MockPrepareError", (Exception,), {}
+    )
+    sys.modules["scylla.errors"].RequestTimeoutError = type(
+        "MockRequestTimeoutError", (Exception,), {}
+    )
+    sys.modules["scylla.errors"].SessionConnectionError = type(
+        "MockSessionConnectionError", (Exception,), {}
+    )
+    sys.modules["scylla.execution_profile"].ExecutionProfile = lambda **kw: None
+    sys.modules["scylla.policies.load_balancing"].DefaultPolicy = lambda **kw: None
+    sys.modules["scylla.policies.load_balancing"].NodeLocationPreference = type(
+        "MockNodeLocationPreference",
+        (),
+        {
+            "datacenter": staticmethod(lambda name: ("dc", name)),
+            "datacenter_and_rack": staticmethod(lambda dc, rack: ("dc_rack", dc, rack)),
+        },
+    )
+    sys.modules["scylla.session"].Session = type("MockSessionImport", (), {})
+    sys.modules["scylla.session_builder"].SessionBuilder = type(
+        "MockSessionBuilderImport", (), {}
+    )
+    sys.modules["scylla.statement"].PreparedStatement = type(
+        "MockPreparedStatementImport", (), {}
+    )
+
 # First Party
-from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.health_monitor.checks.scylla_backend_check import (
+from lmcache.v1.config import LMCacheEngineConfig  # noqa: E402
+from lmcache.v1.health_monitor.checks.scylla_backend_check import (  # noqa: E402
     ScyllaBackendHealthCheck,
 )
-from lmcache.v1.health_monitor.constants import FallbackPolicy
-from lmcache.v1.storage_backend.scylla_backend import ScyllaDBBackend
+from lmcache.v1.health_monitor.constants import FallbackPolicy  # noqa: E402
+from lmcache.v1.storage_backend.scylla_backend import ScyllaDBBackend  # noqa: E402
 
 pytestmark = pytest.mark.no_shared_allocator
 

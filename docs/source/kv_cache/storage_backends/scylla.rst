@@ -72,11 +72,10 @@ Configuration
        ttl_seconds: 86400
        table_compression: "LZ4WithDictsCompressor"
 
-Install the driver on your serving machine:
-
-.. code-block:: bash
-
-   pip install scylla-driver
+Install the driver on your serving machine. ``python-rs-driver`` (package
+``scylla``) is not yet published to PyPI; build it from
+https://github.com/scylladb/python-rs-driver with ``maturin`` (see that
+repo's ``pyproject.toml``/``Makefile``).
 
 Configuration Reference
 ------------------------
@@ -140,9 +139,9 @@ Configure the following options inside the ``scylla`` mapping under
        creation.
    * - ``consistency_level``
      - str
-     - ``"LOCAL_ONE"``
-     - Any ``cassandra.query.ConsistencyLevel`` member name (e.g.
-       ``LOCAL_ONE``, ``QUORUM``, ``ALL``).
+     - ``"LocalOne"``
+     - Any ``scylla.enums.Consistency`` member name (e.g. ``LocalOne``,
+       ``Quorum``, ``All``).
    * - ``timeout_secs``
      - float
      - ``30.0``
@@ -160,38 +159,13 @@ Configure the following options inside the ``scylla`` mapping under
      - int
      - ``2``
      - Number of *additional* attempts (beyond the first) for a single CQL
-       operation when it fails with a transient error (``Unavailable``,
-       ``ReadTimeout``, ``WriteTimeout``, ``OperationTimedOut``,
-       ``NoHostAvailable``).
+       operation when it fails with a transient error (``ExecuteError``,
+       ``PrepareError``, ``RequestTimeoutError``, ``SessionConnectionError``).
    * - ``operation_retry_delay``
      - float
-     - ``0.5``
+     - ``0.05``
      - Initial delay in seconds between operation retries; doubles after
        each attempt, capped at ``operation_retry_max_delay`` (``5.0``).
-       Only applies to genuine cluster-side transient errors, out of a
-       budget of ``operation_max_retries`` retries -- see
-       ``connection_busy_retry_delay`` for the local-backpressure case,
-       which has its own separate budget and backoff schedule.
-   * - ``connection_busy_retry_delay``
-     - float
-     - ``0.01``
-     - Initial delay used instead of ``operation_retry_delay`` when every
-       host in a failed attempt raised ``ConnectionBusy`` -- a full local
-       socket send buffer, not a cluster-side condition. Deliberately well
-       below typical cluster request P99 (often ~10ms): this isn't
-       waiting on the cluster at all, just on the driver's own reactor
-       thread getting scheduled to drain the socket. Doubles after each
-       attempt, capped at ``connection_busy_retry_max_delay`` (``0.25``).
-   * - ``connection_busy_max_retries``
-     - int
-     - ``10``
-     - Separate retry budget for ``connection_busy_retry_delay`` (beyond
-       the first attempt), independent of ``operation_max_retries``.
-       Retrying local backpressure doesn't add load on the cluster the
-       way retrying a genuinely struggling cluster would, so it gets a
-       larger budget -- but a fixed one; sustained ``ConnectionBusy`` for
-       the whole budget likely means sustained excess concurrency rather
-       than a one-off burst.
 
 Health Monitoring
 -----------------
@@ -241,11 +215,12 @@ Limitations
 Troubleshooting
 ---------------
 
-- **ImportError: scylla-driver is required**: run ``pip install
-  scylla-driver``.
+- **ImportError: python-rs-driver is required**: build the ``scylla``
+  package from https://github.com/scylladb/python-rs-driver (not yet on
+  PyPI).
 - **Connection fails on every attempt**: verify ``contact_points``/``port``
   are reachable and that ``local_dc`` matches the target cluster's actual
-  datacenter name (mismatches surface as ``NoHostAvailable``).
+  datacenter name (mismatches surface as ``SessionConnectionError``).
 - **Server warning about low replication factor**: expected for a
   single-node development cluster with the default
   ``keyspace_replication_factor: 1``; raise it (and provision enough nodes

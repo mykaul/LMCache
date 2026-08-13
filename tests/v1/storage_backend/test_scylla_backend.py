@@ -1,28 +1,47 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
-from typing import Any, Optional
+from typing import Any
 from unittest.mock import MagicMock, patch
 import asyncio
-import re
 import sys
 import threading
 import time
 import types
 
-# Create mock cassandra modules BEFORE any other imports, so that
-# scylla_backend's import guard finds them and sets _SCYLLA_AVAILABLE = True.
-_mock_cassandra_modules: dict[str, Any] = {}
+# Create mock scylla (python-rs-driver) modules BEFORE any other imports, so
+# that scylla_backend's import guard finds them and sets
+# _SCYLLA_AVAILABLE = True.
+#
+# Reuse any modules another scylla test file already stubbed (checked via
+# "scylla" itself, not each submodule) instead of unconditionally
+# overwriting them: scylla_backend.py's `from scylla.errors import
+# RequestTimeoutError` etc. only runs on the *first* import across the
+# whole pytest process and binds to whichever objects were in sys.modules
+# at that moment. If this file's module body still replaced them
+# unconditionally, its own local mock classes (e.g. RequestTimeoutError)
+# would no longer be the same objects scylla_backend._RETRYABLE_EXCEPTIONS
+# actually checks against, breaking any test raising the mocked exception
+# type -- overwriting is not just redundant, it silently desyncs identity.
+_already_stubbed = "scylla" in sys.modules
+_mock_scylla_modules: dict[str, Any] = {}
 for _name in [
-    "cassandra",
-    "cassandra.cluster",
-    "cassandra.connection",
-    "cassandra.policies",
-    "cassandra.query",
+    "scylla",
+    "scylla.enums",
+    "scylla.errors",
+    "scylla.execution_profile",
+    "scylla.policies",
+    "scylla.policies.load_balancing",
+    "scylla.session",
+    "scylla.session_builder",
+    "scylla.statement",
 ]:
-    _mod = types.ModuleType(_name)
-    _mock_cassandra_modules[_name] = _mod
-    sys.modules[_name] = _mod
+    if _already_stubbed:
+        _mock_scylla_modules[_name] = sys.modules[_name]
+    else:
+        _mod = types.ModuleType(_name)
+        _mock_scylla_modules[_name] = _mod
+        sys.modules[_name] = _mod
 
 # Also mock out lmcache.c_ops so that memory_management can be imported
 _cops_mod = types.ModuleType("lmcache.c_ops")
@@ -38,50 +57,64 @@ _cops_mod.alloc_pinned_ptr = None
 _cops_mod.free_pinned_ptr = None
 sys.modules["lmcache.c_ops"] = _cops_mod
 
-# Wire sub-modules into parent
-_mock_cassandra_modules["cassandra"].cluster = _mock_cassandra_modules[
-    "cassandra.cluster"
-]
+_scylla_enums = _mock_scylla_modules["scylla.enums"]
+_scylla_errors = _mock_scylla_modules["scylla.errors"]
+_scylla_execution_profile = _mock_scylla_modules["scylla.execution_profile"]
+_scylla_load_balancing = _mock_scylla_modules["scylla.policies.load_balancing"]
+_scylla_session = _mock_scylla_modules["scylla.session"]
+_scylla_session_builder = _mock_scylla_modules["scylla.session_builder"]
+_scylla_statement = _mock_scylla_modules["scylla.statement"]
 
-# Populate mock attributes each module-level consumer expects
-_cass_cluster = _mock_cassandra_modules["cassandra.cluster"]
-_cass_connection = _mock_cassandra_modules["cassandra.connection"]
-_cass_query = _mock_cassandra_modules["cassandra.query"]
-_cass_policies = _mock_cassandra_modules["cassandra.policies"]
-_cass_top = _mock_cassandra_modules["cassandra"]
+if not _already_stubbed:
+    # Wire sub-modules into parent
+    _mock_scylla_modules["scylla"].enums = _scylla_enums
+    _mock_scylla_modules["scylla"].errors = _scylla_errors
+    _mock_scylla_modules["scylla"].execution_profile = _scylla_execution_profile
+    _mock_scylla_modules["scylla"].policies = _mock_scylla_modules["scylla.policies"]
+    _mock_scylla_modules["scylla.policies"].load_balancing = _scylla_load_balancing
+    _mock_scylla_modules["scylla"].session = _scylla_session
+    _mock_scylla_modules["scylla"].session_builder = _scylla_session_builder
+    _mock_scylla_modules["scylla"].statement = _scylla_statement
 
-_cass_cluster.Cluster = type("MockClusterImport", (), {})
-_cass_cluster.Session = type("MockSessionImport", (), {})
-_cass_cluster.EXEC_PROFILE_DEFAULT = object()
-_cass_cluster.ExecutionProfile = lambda **kw: None
-# Real Exception subclasses: scylla_backend.py catches these by type in its
-# retry logic (_RETRYABLE_EXCEPTIONS), so they must be genuine exception
-# classes, not bare `type(...)` placeholders.
-_cass_top.Unavailable = type("MockUnavailable", (Exception,), {})
-_cass_top.ReadTimeout = type("MockReadTimeout", (Exception,), {})
-_cass_top.WriteTimeout = type("MockWriteTimeout", (Exception,), {})
-_cass_top.OperationTimedOut = type("MockOperationTimedOut", (Exception,), {})
-_cass_cluster.NoHostAvailable = type("MockNoHostAvailable", (Exception,), {})
-_cass_connection.ConnectionBusy = type("MockConnectionBusy", (Exception,), {})
-_cass_query.ConsistencyLevel = type(
-    "MockConsistencyLevel",
-    (),
-    {
-        "LOCAL_ONE": 0,
-    },
-)
-_cass_query.PreparedStatement = type("MockPreparedStatement", (), {})
-_cass_query.BatchStatement = type("MockBatchStatement", (), {})
-_cass_query.BatchType = type("MockBatchType", (), {})
-_cass_query.tuple_factory = lambda *args, **kwargs: None
-_cass_policies.DCAwareRoundRobinPolicy = lambda **kw: None
-_cass_policies.RackAwareRoundRobinPolicy = lambda **kw: None
-_cass_policies.TokenAwarePolicy = lambda *a, **kw: None
-_cass_policies.ConstantSpeculativeExecutionPolicy = lambda *a, **kw: None
+    # Populate mock attributes each module-level consumer expects
+    _scylla_enums.Consistency = type(
+        "MockConsistency",
+        (),
+        {"LocalOne": 1, "Quorum": 2, "All": 3},
+    )
+    _scylla_enums.Compression = type("MockCompression", (), {"Lz4": 1, "Snappy": 2})
+    # Real Exception subclasses: scylla_backend.py catches these by type in
+    # its retry logic (_RETRYABLE_EXCEPTIONS), so they must be genuine
+    # exception classes, not bare `type(...)` placeholders.
+    _scylla_errors.ExecuteError = type("MockExecuteError", (Exception,), {})
+    _scylla_errors.PrepareError = type("MockPrepareError", (Exception,), {})
+    _scylla_errors.RequestTimeoutError = type(
+        "MockRequestTimeoutError", (Exception,), {}
+    )
+    _scylla_errors.SessionConnectionError = type(
+        "MockSessionConnectionError", (Exception,), {}
+    )
+    _scylla_execution_profile.ExecutionProfile = lambda **kw: None
+
+    class _MockNodeLocationPreference:
+        """Mimics ``scylla.policies.load_balancing.NodeLocationPreference``."""
+
+        @staticmethod
+        def datacenter(name: str):
+            return ("dc", name)
+
+        @staticmethod
+        def datacenter_and_rack(dc: str, rack: str):
+            return ("dc_rack", dc, rack)
+
+    _scylla_load_balancing.DefaultPolicy = lambda **kw: None
+    _scylla_load_balancing.NodeLocationPreference = _MockNodeLocationPreference
+    _scylla_session.Session = type("MockSessionImport", (), {})
+    _scylla_session_builder.SessionBuilder = type("MockSessionBuilderImport", (), {})
+    _scylla_statement.PreparedStatement = type("MockPreparedStatementImport", (), {})
 
 # Now it's safe to import the scylla backend — _SCYLLA_AVAILABLE will be True
 # Third Party
-import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
@@ -90,10 +123,7 @@ from lmcache.utils import CacheEngineKey, LayerCacheEngineKey  # noqa: E402
 from lmcache.v1.config import LMCacheEngineConfig  # noqa: E402
 from lmcache.v1.metadata import LMCacheMetadata  # noqa: E402
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend  # noqa: E402
-from lmcache.v1.storage_backend.scylla_backend import (  # noqa: E402
-    ScyllaDBBackend,
-    _is_local_connection_busy,
-)
+from lmcache.v1.storage_backend.scylla_backend import ScyllaDBBackend  # noqa: E402
 from tests.v1.utils import create_test_memory_obj  # noqa: E402
 
 
@@ -106,7 +136,7 @@ def create_test_config(
             "port": 9042,
             "keyspace": "test_lmcache",
             "local_dc": "datacenter1",
-            "consistency_level": "LOCAL_ONE",
+            "consistency_level": "LocalOne",
             "ttl_seconds": 86400,
             "table_compression": "LZ4WithDictsCompressor",
         }
@@ -203,14 +233,13 @@ def local_cpu_backend():
 
 @pytest.fixture
 def mock_in_memory_scylla():
-    """Return a mocked Cluster whose session stores rows in a dict.
+    """Return a mocked SessionBuilder whose session stores rows in a dict.
 
-    Mirrors the real ``cassandra.cluster`` API surface (``Cluster.connect``,
-    ``Session.execute``, ``Session.execute_async`` returning a
-    ``ResponseFuture``-like object, ``Session.prepare``) rather than the
-    fictional ``connect_async``/``execute_async``-as-coroutine/
-    ``prepare_async`` methods the production code used to (incorrectly)
-    assume existed.
+    Mirrors the real ``scylla`` (python-rs-driver) API surface --
+    ``SessionBuilder().connect()``, ``Session.execute`` (async, returning a
+    ``RequestResult``-like object with ``iter_current_page()``),
+    ``Session.prepare`` (async) -- rather than the old ``cassandra`` driver's
+    callback-based ``execute_async``/``add_callbacks``.
     """
 
     store: dict[str, dict[tuple[int, int], tuple[bytes, bytes]]] = {}
@@ -221,29 +250,18 @@ def mock_in_memory_scylla():
             return stmt.__dict__["_mock_table"]
         return fallback
 
-    class MockResponseFuture:
-        """Mimics ``cassandra.cluster.ResponseFuture``'s callback API."""
+    class MockRequestResult:
+        """Mimics ``scylla.results.RequestResult`` for a single, final page."""
 
-        def __init__(self, rows: list, error: Optional[Exception] = None):
+        def __init__(self, rows: list):
             self._rows = rows
-            self._error = error
-            # This mock never produces more than one page of results.
-            self.has_more_pages = False
 
-        def add_callbacks(self, callback, errback) -> None:
-            if self._error is not None:
-                errback(self._error)
-            else:
-                callback(self._rows)
-
-        def start_fetching_next_page(self) -> None:
-            """No-op: this mock never produces more than one page."""
+        def iter_current_page(self):
+            return iter(self._rows)
 
     class MockSession:
-        default_timeout = 30.0
-
         def _compute_rows(self, stmt, params=None) -> list:
-            # _ensure_keyspace_exists() passes a raw CQL string (no
+            # _ensure_keyspace_exists_async() passes a raw CQL string (no
             # PreparedStatement wrapping the DDL); everything else goes
             # through self.prepare() first, producing a MagicMock with a
             # `_mock_cql` attribute.
@@ -263,30 +281,14 @@ def mock_in_memory_scylla():
                 chunk_hash, layer_id = params
                 return [chunk_hash] if (chunk_hash, layer_id) in tbl else []
 
-            if "ORDER BY layer_id ASC" in cql:
-                (chunk_hash,) = params
-                matched = sorted(
-                    [(k, v) for k, v in tbl.items() if k[0] == chunk_hash],
-                    key=lambda x: x[0][1],
-                )
-                rows = []
-                for (ch, lid), (kdata, vdata) in matched:
-                    row = MagicMock()
-                    row.chunk_hash = ch
-                    row.layer_id = lid
-                    row.k_data = kdata
-                    row.v_data = vdata
-                    rows.append(row)
-                return rows
-
             if cql.startswith("SELECT") and "AND layer_id" in cql:
                 chunk_hash, layer_id = params
                 item = tbl.get((chunk_hash, layer_id))
                 if item is not None:
-                    # Session.row_factory is tuple_factory in production
-                    # (see scylla_backend._connect); match its shape here.
+                    # Default row factory is dict-of-columns in production
+                    # (see scylla_backend._reconstruct_tensor); match here.
                     kdata, vdata = item
-                    return [(kdata, vdata)]
+                    return [{"k_data": kdata, "v_data": vdata}]
                 return []
 
             if cql.startswith("DELETE") and "AND layer_id" in cql:
@@ -303,36 +305,51 @@ def mock_in_memory_scylla():
 
             return []
 
-        def execute(self, stmt, params=None) -> list:
-            return self._compute_rows(stmt, params)
+        async def execute(
+            self, stmt, params=None, *, factory=None, paging_state=None, paged=True
+        ) -> MockRequestResult:
+            return MockRequestResult(self._compute_rows(stmt, params))
 
-        def execute_async(self, stmt, params=None) -> MockResponseFuture:
-            try:
-                return MockResponseFuture(self._compute_rows(stmt, params))
-            except Exception as e:
-                return MockResponseFuture([], error=e)
-
-        def prepare(self, cql):
+        async def prepare(self, cql):
             stmt = MagicMock()
             stmt._mock_cql = cql
-            stmt.consistency_level = None
-            m = re.search(r"kv_chunks_\S+", cql)
-            if m:
-                stmt._mock_table = m.group(0)
+            stmt.with_consistency.return_value = stmt
+            stmt.set_is_idempotent.return_value = stmt
+            match = None
+            for word in cql.split():
+                if word.startswith("kv_chunks_"):
+                    match = word
+                    break
+            if match:
+                stmt._mock_table = match
             return stmt
 
-        def set_keyspace(self, keyspace: str) -> None:
+        async def use_keyspace(
+            self, keyspace: str, case_sensitive: bool = False
+        ) -> None:
             """No-op: `store` above is a flat dict of table->rows, not
             scoped per-keyspace, so there is nothing to switch."""
 
-    class MockCluster:
-        def connect(self, keyspace=None):
+    class MockSessionBuilder:
+        def contact_points(self, contact_points):
+            return self
+
+        def execution_profile(self, execution_profile):
+            return self
+
+        def compression(self, compression):
+            return self
+
+        def connection_timeout(self, timeout):
+            return self
+
+        async def connect(self):
             return MockSession()
 
-    mock_cluster = MockCluster()
-    mock_cluster.executed_cql = executed_cql
-    mock_cluster.store = store
-    return mock_cluster
+    mock_session_builder = MockSessionBuilder()
+    mock_session_builder.executed_cql = executed_cql
+    mock_session_builder.store = store
+    return mock_session_builder
 
 
 @pytest.fixture
@@ -340,7 +357,7 @@ def backend(async_loop, local_cpu_backend, mock_in_memory_scylla):
     config = create_test_config()
     metadata = create_test_metadata()
     with patch(
-        "lmcache.v1.storage_backend.scylla_backend.Cluster",
+        "lmcache.v1.storage_backend.scylla_backend.SessionBuilder",
         return_value=mock_in_memory_scylla,
     ):
         backend = ScyllaDBBackend(
@@ -384,7 +401,7 @@ class TestScyllaDBBackend:
         metadata = create_test_metadata()
         with (
             patch(
-                "lmcache.v1.storage_backend.scylla_backend.Cluster",
+                "lmcache.v1.storage_backend.scylla_backend.SessionBuilder",
                 return_value=mock_in_memory_scylla,
             ),
             patch("sys.setswitchinterval") as mock_set_interval,
@@ -409,7 +426,7 @@ class TestScyllaDBBackend:
         metadata = create_test_metadata()
         with (
             patch(
-                "lmcache.v1.storage_backend.scylla_backend.Cluster",
+                "lmcache.v1.storage_backend.scylla_backend.SessionBuilder",
                 return_value=mock_in_memory_scylla,
             ),
             patch("sys.setswitchinterval") as mock_set_interval,
@@ -435,25 +452,28 @@ class TestScyllaDBBackend:
             for cql in mock_in_memory_scylla.executed_cql
         )
 
-    def test_connect_uses_rack_aware_policy_when_local_rack_configured(
+    def test_connect_uses_rack_scoped_preference_when_local_rack_configured(
         self, async_loop, local_cpu_backend, mock_in_memory_scylla
     ):
-        """local_rack must select RackAwareRoundRobinPolicy, not
-        DCAwareRoundRobinPolicy -- the latter has no local_rack parameter
-        at all and raises TypeError if passed one."""
+        """local_rack must select
+        NodeLocationPreference.datacenter_and_rack(), not
+        NodeLocationPreference.datacenter() -- the latter has no rack
+        parameter at all."""
         config = create_test_config({"scylla": {"local_rack": "rack1"}})
         metadata = create_test_metadata()
         with (
             patch(
-                "lmcache.v1.storage_backend.scylla_backend.Cluster",
+                "lmcache.v1.storage_backend.scylla_backend.SessionBuilder",
                 return_value=mock_in_memory_scylla,
             ),
             patch(
-                "lmcache.v1.storage_backend.scylla_backend.RackAwareRoundRobinPolicy"
-            ) as mock_rack_policy,
+                "lmcache.v1.storage_backend.scylla_backend"
+                ".NodeLocationPreference.datacenter_and_rack"
+            ) as mock_dc_rack,
             patch(
-                "lmcache.v1.storage_backend.scylla_backend.DCAwareRoundRobinPolicy"
-            ) as mock_dc_policy,
+                "lmcache.v1.storage_backend.scylla_backend"
+                ".NodeLocationPreference.datacenter"
+            ) as mock_dc_only,
         ):
             backend = ScyllaDBBackend(
                 dst_device="cpu",
@@ -462,10 +482,8 @@ class TestScyllaDBBackend:
                 local_cpu_backend=local_cpu_backend,
                 loop=async_loop,
             )
-            mock_rack_policy.assert_called_once_with(
-                local_dc="datacenter1", local_rack="rack1"
-            )
-            mock_dc_policy.assert_not_called()
+            mock_dc_rack.assert_called_once_with("datacenter1", "rack1")
+            mock_dc_only.assert_not_called()
             backend.close()
 
     def test_put_get_roundtrip(self, backend):
@@ -483,15 +501,13 @@ class TestScyllaDBBackend:
         assert result.tensor is not None
         assert torch.equal(result.tensor, original)
 
-    def test_put_sends_zero_copy_views_of_the_source_tensor(
+    def test_put_sends_bytes_matching_the_source_tensor(
         self, backend, mock_in_memory_scylla
     ):
-        """PUT must hand the driver views into the source tensor's own
-        memory, not copies -- measured (isolated micro-benchmark, no
-        network) to be faster than copying here: spreading many per-layer
-        memcpys across self._blob_executor's threads costs more in
-        GIL/thread-pool contention than doing them on the single thread
-        that calls execute_async."""
+        """PUT must hand the driver real ``bytes`` of each layer's K/V slice
+        (the blob serializer rejects anything else, e.g. an ``ndarray`` --
+        see ``ScyllaDBBackend._split_kv``), byte-for-byte identical to the
+        source tensor's own memory at that layer's offset."""
         key = create_test_key(50)
         mem_obj = create_test_memory_obj(shape=_TEST_MEM_SHAPE)
         assert mem_obj.tensor is not None
@@ -500,15 +516,21 @@ class TestScyllaDBBackend:
         backend.batched_submit_put_task([key], [mem_obj])
         _wait_for_puts(backend, [key])
 
-        stored = next(
-            item
+        layer_id, stored = next(
+            (layer_id, item)
             for table in mock_in_memory_scylla.store.values()
-            for (chunk_hash, _layer_id), item in table.items()
+            for (chunk_hash, layer_id), item in table.items()
             if chunk_hash == key.chunk_hash
         )
         k_blob, v_blob = stored
-        assert np.shares_memory(k_blob, tensor_bytes)
-        assert np.shares_memory(v_blob, tensor_bytes)
+        assert isinstance(k_blob, bytes)
+        assert isinstance(v_blob, bytes)
+        num_layers = _TEST_MEM_SHAPE[1]
+        bytes_per_layer = len(k_blob)
+        k_off = layer_id * bytes_per_layer
+        v_off = (num_layers + layer_id) * bytes_per_layer
+        assert k_blob == tensor_bytes[k_off : k_off + bytes_per_layer].tobytes()
+        assert v_blob == tensor_bytes[v_off : v_off + bytes_per_layer].tobytes()
 
     def test_contains(self, backend):
         key = create_test_key(2)
@@ -779,35 +801,6 @@ class TestScyllaDBBackend:
         with pytest.raises(RuntimeError, match="closed"):
             future.result(timeout=5.0)
 
-    @pytest.mark.parametrize(
-        "errors,expected",
-        [
-            ({"host1": _cass_connection.ConnectionBusy("busy")}, True),
-            (
-                {
-                    "host1": _cass_connection.ConnectionBusy("busy"),
-                    "host2": _cass_connection.ConnectionBusy("busy"),
-                },
-                True,
-            ),
-            (
-                {
-                    "host1": _cass_connection.ConnectionBusy("busy"),
-                    "host2": _cass_top.Unavailable("down"),
-                },
-                False,
-            ),
-            ({}, False),
-        ],
-    )
-    def test_is_local_connection_busy_classification(self, errors, expected):
-        exc = _cass_cluster.NoHostAvailable("no host available")
-        exc.errors = errors
-        assert _is_local_connection_busy(exc) is expected
-
-    def test_is_local_connection_busy_rejects_other_exception_types(self):
-        assert _is_local_connection_busy(_cass_top.Unavailable("down")) is False
-
     async def _retry_and_capture_delays(
         self, backend, exc_factory, fail_count: int
     ) -> list[float]:
@@ -831,27 +824,18 @@ class TestScyllaDBBackend:
         assert result == "ok"
         return delays
 
-    def test_retry_async_uses_short_delay_for_connection_busy(
+    def test_retry_async_uses_operation_delay_for_transient_error(
         self, backend, async_loop
     ):
-        def make_exc():
-            exc = _cass_cluster.NoHostAvailable("no host available")
-            exc.errors = {"host1": _cass_connection.ConnectionBusy("busy")}
-            return exc
-
-        future = asyncio.run_coroutine_threadsafe(
-            self._retry_and_capture_delays(backend, make_exc, fail_count=1),
-            async_loop,
-        )
-        delays = future.result(timeout=5.0)
-        assert delays == [backend._connection_busy_retry_delay]
-
-    def test_retry_async_uses_cluster_delay_for_genuine_transient_error(
-        self, backend, async_loop
-    ):
+        """_retry_async uses a single retry budget (operation_retry_delay)
+        for every retryable error -- the old driver's separate, shorter
+        budget for local send-buffer backpressure has no equivalent here
+        (see the class's _RETRYABLE_EXCEPTIONS/_retry_async docstrings)."""
         future = asyncio.run_coroutine_threadsafe(
             self._retry_and_capture_delays(
-                backend, lambda: _cass_top.Unavailable("down"), fail_count=1
+                backend,
+                lambda: _scylla_errors.RequestTimeoutError("timed out"),
+                fail_count=1,
             ),
             async_loop,
         )

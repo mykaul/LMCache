@@ -6,7 +6,6 @@ from concurrent.futures import (
     ThreadPoolExecutor,
     TimeoutError,
 )
-import os
 from typing import (
     Any,
     Callable,
@@ -20,84 +19,55 @@ from typing import (
 import asyncio
 import functools
 import re
-import socket
 import sys
 import threading
 import time
 
 # Third Party
-import numpy as np
-import numpy.typing as npt
 import torch
 
 try:
     # Third Party
-    from cassandra import OperationTimedOut, ReadTimeout, Unavailable, WriteTimeout
-    from cassandra.cluster import (
-        EXEC_PROFILE_DEFAULT,
-        Cluster,
-        ExecutionProfile,
-        NoHostAvailable,
-        Session,
+    from scylla.enums import Compression, Consistency
+    from scylla.errors import (
+        ExecuteError,
+        PrepareError,
+        RequestTimeoutError,
+        SessionConnectionError,
     )
-    from cassandra.connection import ConnectionBusy
-    from cassandra.policies import (
-        ConstantSpeculativeExecutionPolicy,
-        DCAwareRoundRobinPolicy,
-        RackAwareRoundRobinPolicy,
-        TokenAwarePolicy,
-    )
-    from cassandra.query import ConsistencyLevel, PreparedStatement, tuple_factory
+    from scylla.execution_profile import ExecutionProfile
+    from scylla.policies.load_balancing import DefaultPolicy, NodeLocationPreference
+    from scylla.session import Session
+    from scylla.session_builder import SessionBuilder
+    from scylla.statement import PreparedStatement
 
     _SCYLLA_AVAILABLE = True
     # Transient, retryable conditions: the coordinator/replica(s) were
-    # temporarily unavailable or too slow, or no host in the query plan
-    # could be reached. Anything else (e.g. InvalidRequest, syntax errors,
+    # temporarily unavailable or too slow, or the client couldn't reach the
+    # cluster at all. Anything else (e.g. InvalidRequest, syntax errors,
     # AuthenticationFailed) indicates a permanent/logical error and must
-    # not be retried.
+    # not be retried. Deliberately narrower than ``UseKeyspaceError``
+    # (``RequestTimeoutError``'s actual parent in this driver's hierarchy):
+    # that parent also covers permanent config errors like
+    # ``BadKeyspaceNameError``, which must not be retried.
     _RETRYABLE_EXCEPTIONS: tuple = (
-        Unavailable,
-        ReadTimeout,
-        WriteTimeout,
-        OperationTimedOut,
-        NoHostAvailable,
+        ExecuteError,
+        PrepareError,
+        RequestTimeoutError,
+        SessionConnectionError,
     )
 except ImportError:
     _SCYLLA_AVAILABLE = False
     _RETRYABLE_EXCEPTIONS = ()
 
 
-def _is_local_connection_busy(exc: BaseException) -> bool:
-    """
-    Check whether *exc* represents purely local connection backpressure.
-
-    ``NoHostAvailable`` wraps one exception per host the driver tried; if
-    every one of them is ``ConnectionBusy`` (the local send buffer was
-    full, raised straight from the socket layer -- see
-    ``cassandra/io/libevreactor.py``), no cluster-side condition was
-    involved at all, so it doesn't warrant the same cautious backoff as a
-    genuine cluster-side transient error (``Unavailable``, ``ReadTimeout``,
-    etc., or a ``NoHostAvailable`` wrapping an actual host-down error).
-
-    :param exc: The exception caught by :meth:`_retry_async`.
-    :return: True if *exc* is a ``NoHostAvailable`` wrapping only
-        ``ConnectionBusy`` errors.
-    """
-    if not isinstance(exc, NoHostAvailable):
-        return False
-    errors = exc.errors.values()
-    return bool(errors) and all(isinstance(e, ConnectionBusy) for e in errors)
-
-
 class _RetryBudget(NamedTuple):
-    """Backoff state for one class of transient error (see ``_retry_async``).
+    """Backoff state for the retry policy in :meth:`ScyllaDBBackend._retry_async`.
 
     Bundles the current backoff delay, the retry ceiling, and how many
-    retries remain into one immutable value. Both call sites that implement
-    the two-budget retry policy -- :meth:`ScyllaDBBackend._retry_async` and
-    the per-layer fan-out in :meth:`ScyllaDBBackend._fetch_all_layers_async`
-    -- derive every subsequent attempt from :meth:`next`, so the
-    delay-doubling-with-cap arithmetic lives in exactly one place.
+    retries remain into one immutable value; :meth:`next` derives each
+    subsequent attempt's state, so the delay-doubling-with-cap arithmetic
+    lives in exactly one place.
     """
 
     delay: float
@@ -108,8 +78,7 @@ class _RetryBudget(NamedTuple):
         """Return this budget's state after one retry attempt is consumed.
 
         The delay doubles each attempt, capped at ``max_delay``. Returns a
-        new object (NamedTuples are immutable), so a retry under one error
-        class never mutates the budget the other class is retrying under.
+        new object (NamedTuples are immutable) rather than mutating self.
         """
         return _RetryBudget(
             delay=min(self.delay * 2, self.max_delay),
@@ -175,26 +144,6 @@ _CQL_EXISTS = (
 )
 
 _CQL_DELETE_ONE = "DELETE FROM {table} WHERE chunk_hash = ? AND layer_id = ?"
-
-
-def _set_result(future: "asyncio.Future[Any]", value: Any) -> None:
-    """Resolve *future* with *value* unless it is already done.
-
-    Used from driver callback threads (via ``call_soon_threadsafe``), where
-    the future may already have been cancelled or resolved concurrently.
-    """
-    if not future.done():
-        future.set_result(value)
-
-
-def _set_exception(future: "asyncio.Future[Any]", exc: BaseException) -> None:
-    """Fail *future* with *exc* unless it is already done.
-
-    Used from driver callback threads (via ``call_soon_threadsafe``), where
-    the future may already have been cancelled or resolved concurrently.
-    """
-    if not future.done():
-        future.set_exception(exc)
 
 
 _T = TypeVar("_T")
@@ -272,58 +221,30 @@ class ScyllaDBBackend(StoragePluginInterface):
       an invalid name surfaces as a CQL ``InvalidRequest`` error on table
       creation.
     - ``wire_compression`` (bool, default ``False``): whether the driver
-      negotiates native-protocol (lz4/snappy) compression. Off by default --
-      KV tensor bytes are already dense, so compression only costs CPU.
-    - ``consistency_level`` (str, default ``"LOCAL_ONE"``)
+      negotiates native-protocol (lz4) compression. Off by default -- KV
+      tensor bytes are already dense, so compression only costs CPU.
+    - ``consistency_level`` (str, default ``"LocalOne"``): a
+      ``scylla.enums.Consistency`` member name, e.g. ``LocalOne``,
+      ``Quorum``, ``All``.
     - ``timeout_secs`` (float, default ``30.0``)
     - ``max_connect_retries`` (int, default ``3``)
     - ``connect_retry_delay`` (float, default ``1.0``)
     - ``operation_max_retries`` (int, default ``2``): number of *additional*
       attempts (beyond the first) for a single CQL operation when it fails
-      with a transient error (``Unavailable``, ``ReadTimeout``,
-      ``WriteTimeout``, ``OperationTimedOut``, ``NoHostAvailable``).
+      with a transient error (``ExecuteError``, ``PrepareError``,
+      ``RequestTimeoutError``, ``SessionConnectionError``).
     - ``operation_retry_delay`` (float, default ``0.05``): initial delay in
       seconds (50ms) between operation retries; doubles after each attempt,
-      capped at ``operation_retry_max_delay`` (default ``5.0``). Only
-      applies to genuine cluster-side transient errors (out of a budget of
-      ``operation_max_retries`` retries); see ``connection_busy_retry_delay``
-      for the local-backpressure case, which has its own separate budget
-      and backoff schedule.
-    - ``connection_busy_retry_delay`` (float, default ``0.01``): initial
-      delay used instead of ``operation_retry_delay`` when every host in a
-      failed attempt raised ``ConnectionBusy`` (a full local socket send
-      buffer, not a cluster-side condition -- see
-      :func:`_is_local_connection_busy`). Deliberately well below typical
-      cluster request P99 (often ~10ms): this isn't waiting on the
-      cluster at all, just on the driver's own reactor thread getting
-      scheduled to drain the socket. Doubles after each attempt, capped at
-      ``connection_busy_retry_max_delay`` (default ``0.25``).
-    - ``connection_busy_max_retries`` (int, default ``10``): separate retry
-      budget for ``connection_busy_retry_delay`` (beyond the first
-      attempt), independent of ``operation_max_retries``. Retrying local
-      backpressure doesn't add load on the cluster the way retrying a
-      genuinely struggling cluster would, so it gets a larger budget --
-      but a fixed one, since sustained ``ConnectionBusy`` for the whole
-      budget likely means the client is issuing more concurrent requests
-      than the connection pool can carry, not a one-off burst.
-    - ``speculative_execution_enabled`` (bool, default ``True``): fires an
-      extra request to a different replica after
-      ``speculative_execution_delay`` if the first hasn't returned, taking
-      whichever comes back first. Safe since every prepared statement is
-      marked ``is_idempotent = True``. Enabled by default -- fires a
-      duplicate request only after ``speculative_execution_delay`` (default
-      0.5s, tune to the deployment's own P50-P75 latency), so it trades a
-      little extra request volume for materially lower tail latency on
-      slow reads (e.g. the single-shard long tail seen in e2e get paths).
-    - ``speculative_execution_delay`` (float, default ``0.5``): seconds
-      before firing a speculative retry. Tune to the deployment's own
-      P50-P75 latency.
-    - ``speculative_execution_max_attempts`` (int, default ``2``): max
-      speculative attempts per request.
+      capped at ``operation_retry_max_delay`` (default ``5.0``).
     - ``gil_switch_interval_secs`` (float, default ``None``): if set, calls
       ``sys.setswitchinterval()`` with this value. Process-global, not
       scoped to this backend -- see benchmarks/scylla_e2e/gil_load_bench.py
       for measured impact under GIL contention.
+
+    Not currently supported by ``python-rs-driver`` (dropped when this
+    backend was ported off the old ``cassandra``-based driver, not
+    carried forward as a no-op): per-request speculative execution, and
+    explicit socket send/receive buffer sizing.
     """
 
     def __init__(
@@ -337,8 +258,9 @@ class ScyllaDBBackend(StoragePluginInterface):
         super().__init__(dst_device=dst_device)
         if not _SCYLLA_AVAILABLE:
             raise ImportError(
-                "scylla-driver is required for ScyllaDBBackend. "
-                "Install it with: pip install scylla-driver"
+                "python-rs-driver (package `scylla`) is required for "
+                "ScyllaDBBackend. Not yet on PyPI -- build it from "
+                "https://github.com/scylladb/python-rs-driver (maturin)."
             )
 
         self.config = config
@@ -364,14 +286,14 @@ class ScyllaDBBackend(StoragePluginInterface):
         self._compressor_class: str = str(scylla_cfg.get("table_compression", ""))
         self._wire_compression: bool = bool(scylla_cfg.get("wire_compression", False))
 
-        cl_name = str(scylla_cfg.get("consistency_level", "LOCAL_ONE")).upper()
-        if not hasattr(ConsistencyLevel, cl_name):
+        cl_name = str(scylla_cfg.get("consistency_level", "LocalOne"))
+        if not hasattr(Consistency, cl_name):
             raise ValueError(
                 f"Invalid scylla.consistency_level={cl_name!r}; must be a "
-                f"valid cassandra.query.ConsistencyLevel name (e.g. "
-                f"LOCAL_ONE, QUORUM, ALL)"
+                f"valid scylla.enums.Consistency name (e.g. "
+                f"LocalOne, Quorum, All)"
             )
-        self._consistency: ConsistencyLevel = getattr(ConsistencyLevel, cl_name)
+        self._consistency: "Consistency" = getattr(Consistency, cl_name)
 
         self._timeout: float = float(scylla_cfg.get("timeout_secs", 30))
         self._max_connect_retries: int = int(scylla_cfg.get("max_connect_retries", 3))
@@ -386,24 +308,6 @@ class ScyllaDBBackend(StoragePluginInterface):
         )
         self._operation_retry_max_delay: float = float(
             scylla_cfg.get("operation_retry_max_delay", 5.0)
-        )
-        self._connection_busy_retry_delay: float = float(
-            scylla_cfg.get("connection_busy_retry_delay", 0.01)
-        )
-        self._connection_busy_retry_max_delay: float = float(
-            scylla_cfg.get("connection_busy_retry_max_delay", 0.25)
-        )
-        self._connection_busy_max_retries: int = int(
-            scylla_cfg.get("connection_busy_max_retries", 10)
-        )
-        self._speculative_execution_enabled: bool = bool(
-            scylla_cfg.get("speculative_execution_enabled", True)
-        )
-        self._speculative_execution_delay: float = float(
-            scylla_cfg.get("speculative_execution_delay", 0.5)
-        )
-        self._speculative_execution_max_attempts: int = int(
-            scylla_cfg.get("speculative_execution_max_attempts", 2)
         )
         self._gil_switch_interval_secs: Optional[float] = scylla_cfg.get(
             "gil_switch_interval_secs", None
@@ -426,10 +330,15 @@ class ScyllaDBBackend(StoragePluginInterface):
         self._active_gets = 0
         self._active_gets_lock = threading.Lock()
 
-        # Dedicated pool for blob copy work (split/reconstruct) so it
-        # never starves the shared default executor's prepare round-trips.
+        # Dedicated pool for blob copy work (split/reconstruct) so it never
+        # starves the shared default executor's prepare round-trips. Exactly
+        # one worker: these copies hold the GIL end to end, so extra threads
+        # add no throughput and only convoy on it (measured, 32MiB chunks at
+        # concurrency 30: same wall clock, per-chunk p99 9.8ms -> 133ms
+        # going 1 -> 8). Only a driver that took buffer-protocol blobs --
+        # removing the bytes materialization -- would change that.
         self._blob_executor = ThreadPoolExecutor(
-            max_workers=max(4, (os.cpu_count() or 2) // 2),
+            max_workers=1,
             thread_name_prefix="lmcache-scylla-blob",
         )
 
@@ -443,15 +352,13 @@ class ScyllaDBBackend(StoragePluginInterface):
 
         # Prepared-statement cache, keyed by CQL text. The driver performs a
         # network round-trip on every Session.prepare() call and does not
-        # deduplicate repeated identical queries itself (see
-        # cassandra.cluster.Session.prepare's docstring), so callers are
+        # deduplicate repeated identical queries itself, so callers are
         # expected to cache and reuse PreparedStatement objects.
         self._prepared_statements: dict[str, "PreparedStatement"] = {}
         self._prepared_statements_lock = threading.Lock()
 
         # Driver resources
-        self._cluster: Optional[Cluster] = None
-        self._session: Optional[Session] = None
+        self._session: Optional["Session"] = None
         self._closed = False
 
         # Cached hidden_dim/num_layers from metadata
@@ -510,77 +417,65 @@ class ScyllaDBBackend(StoragePluginInterface):
             )
 
     def _connect(self) -> None:
-        """Connect to ScyllaDB with retries."""
+        """Connect to ScyllaDB with retries.
+
+        Dispatches :meth:`_connect_async` onto ``self.loop`` via
+        :meth:`_sync_execute` and blocks this (the calling) thread for the
+        result -- ``SessionBuilder.connect()``/``Session.execute()`` are
+        coroutines in this driver, unlike the old driver's synchronous
+        ``Cluster.connect()``.
+        """
         if self._closed:
             return
-        # An event loop is required for all other operations (_execute()
-        # bridges onto it), even though connecting itself is synchronous.
-        if self.loop is None:
-            raise RuntimeError("Event loop is required for ScyllaDBBackend")
+        # Bounds the whole retry loop: each attempt is itself capped by
+        # connection_timeout(self._timeout), plus a retry_delay sleep
+        # between attempts.
+        overall_timeout = self._max_connect_retries * (
+            self._timeout + self._connect_retry_delay
+        )
+        self._sync_execute(self._connect_async(), timeout=overall_timeout)
 
+    async def _connect_async(self) -> None:
+        """Async core of :meth:`_connect`."""
         last_exc: Exception = RuntimeError("Failed to connect to ScyllaDB")
         for attempt in range(1, self._max_connect_retries + 1):
             try:
-                # RackAwareRoundRobinPolicy requires local_rack; it cannot
-                # be constructed at all when it isn't configured, so pick
-                # the policy class based on whether it is.
-                if self._local_rack is not None:
-                    policy = RackAwareRoundRobinPolicy(
-                        local_dc=self._local_dc, local_rack=self._local_rack
+                # RackAwareRoundRobinPolicy-equivalent: DefaultPolicy takes a
+                # single NodeLocationPreference, rack-scoped only if
+                # local_rack is configured (mirrors the old driver's
+                # dc-only vs. dc+rack policy choice).
+                location = (
+                    NodeLocationPreference.datacenter_and_rack(
+                        self._local_dc, self._local_rack
                     )
-                else:
-                    policy = DCAwareRoundRobinPolicy(local_dc=self._local_dc)
-                # load_balancing_policy/request_timeout/speculative_execution_policy
-                # must live on one ExecutionProfile: Cluster rejects mixing
-                # execution_profiles with the legacy load_balancing_policy
-                # kwarg, and Session.default_timeout can't be set once
-                # execution_profiles is used.
-                speculative_policy = (
-                    ConstantSpeculativeExecutionPolicy(
-                        self._speculative_execution_delay,
-                        self._speculative_execution_max_attempts,
-                    )
-                    if self._speculative_execution_enabled
-                    else None
+                    if self._local_rack is not None
+                    else NodeLocationPreference.datacenter(self._local_dc)
                 )
-                self._cluster = Cluster(
-                    contact_points=self._contact_points,
-                    port=self._port,
-                    compression=self._wire_compression,
-                    execution_profiles={
-                        EXEC_PROFILE_DEFAULT: ExecutionProfile(
-                            load_balancing_policy=TokenAwarePolicy(policy),
-                            request_timeout=self._timeout,
-                            speculative_execution_policy=speculative_policy,
-                            # Must live here, not Session.row_factory --
-                            # ValueError once execution_profiles is in use.
-                            row_factory=tuple_factory,
-                        )
-                    },
-                    # Explicit buffers avoid ConnectionBusy: autotuning starts
-                    # a fresh connection at tcp_wmem's small default, but a
-                    # whole-chunk put fans out into concurrent per-layer
-                    # INSERTs before it ramps up. 4MB is the tested sufficient
-                    # size; requires net.core.wmem_max/rmem_max (and tcp_wmem/
-                    # rmem) raised at the OS level or the kernel silently
-                    # clamps it. No TCP_NODELAY; buffer sizing is what matters.
-                    sockopts=[
-                        (socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024),
-                        (socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024),
-                    ],
-                    # Don't set default_retry_policy: a non-RetryPolicy value (e.g.
-                    # an int) slips past Cluster.__init__ and only crashes on
-                    # the first retryable condition. Omitting it uses the
-                    # driver default.
+                profile = ExecutionProfile(
+                    timeout=self._timeout,
+                    consistency=self._consistency,
+                    load_balancing_policy=DefaultPolicy(
+                        node_location_preference=location, token_aware=True
+                    ),
+                )
+                # Only Lz4/Snappy are exposed (no plain bool toggle); Lz4
+                # matches the old driver's default when compression was on.
+                compression = Compression.Lz4 if self._wire_compression else None
+                builder = (
+                    SessionBuilder()
+                    .contact_points([(cp, self._port) for cp in self._contact_points])
+                    .execution_profile(profile)
+                    .compression(compression)
+                    .connection_timeout(self._timeout)
                 )
                 # Connect without a keyspace first: the configured keyspace
-                # may not exist yet, and Cluster.connect(keyspace) fails
-                # outright (unlike CREATE TABLE IF NOT EXISTS below) if it
-                # doesn't. _ensure_keyspace_exists() creates it if needed,
-                # then set_keyspace() binds this session to it.
-                self._session = self._cluster.connect()
-                self._ensure_keyspace_exists()
-                self._session.set_keyspace(self._keyspace)
+                # may not exist yet, and binding to a nonexistent keyspace
+                # up front fails outright (unlike CREATE TABLE IF NOT EXISTS
+                # below). _ensure_keyspace_exists_async() creates it if
+                # needed, then use_keyspace() binds this session to it.
+                self._session = await builder.connect()
+                await self._ensure_keyspace_exists_async()
+                await self._session.use_keyspace(self._keyspace)
                 logger.info(
                     "Connected to ScyllaDB at %s:%d/%s (attempt %d)",
                     self._contact_points,
@@ -599,7 +494,7 @@ class ScyllaDBBackend(StoragePluginInterface):
                 )
                 self._cleanup_resources()
                 if attempt < self._max_connect_retries:
-                    time.sleep(self._connect_retry_delay)
+                    await asyncio.sleep(self._connect_retry_delay)
 
         logger.error(
             "Failed to connect to ScyllaDB after %d attempts",
@@ -607,7 +502,7 @@ class ScyllaDBBackend(StoragePluginInterface):
         )
         raise last_exc
 
-    def _ensure_keyspace_exists(self) -> None:
+    async def _ensure_keyspace_exists_async(self) -> None:
         """Create the configured keyspace if it does not already exist.
 
         Uses ``NetworkTopologyStrategy`` scoped to ``local_dc`` (matching
@@ -618,25 +513,24 @@ class ScyllaDBBackend(StoragePluginInterface):
         replication topology is appropriate before pointing this backend
         at it; ``CREATE KEYSPACE IF NOT EXISTS`` is then a no-op.
 
-        Called from :meth:`_connect` on a session not yet bound to a
-        keyspace (``Session.set_keyspace`` fails if the keyspace doesn't
-        exist yet, so this must run first).
+        Called from :meth:`_connect_async` on a session not yet bound to a
+        keyspace (``use_keyspace`` fails if the keyspace doesn't exist yet,
+        so this must run first).
         """
         cql = _CQL_CREATE_KEYSPACE.format(
             keyspace=self._keyspace,
             local_dc=self._local_dc,
             replication_factor=self._keyspace_replication_factor,
         )
-        self._safe_session.execute(cql)
+        await self._safe_session.execute(cql)
 
     def _cleanup_resources(self) -> None:
-        """Shut down this backend's ScyllaDB session and release resources."""
-        if self._cluster is not None:
-            try:
-                self._cluster.shutdown()
-            except Exception:
-                pass
-            self._cluster = None
+        """Release this backend's ScyllaDB session.
+
+        The new driver exposes no explicit ``close()``/``shutdown()`` on
+        ``Session`` (unlike the old driver's ``Cluster.shutdown()``), so
+        dropping the reference is the whole cleanup.
+        """
         self._session = None
 
     @staticmethod
@@ -703,7 +597,7 @@ class ScyllaDBBackend(StoragePluginInterface):
         return self.loop
 
     @property
-    def _safe_session(self) -> Session:
+    def _safe_session(self) -> "Session":
         # Single read of self._session: close() can concurrently null it
         # out from another thread between a check and a second read, which
         # would let a None slip through as if it were a live Session.
@@ -770,8 +664,8 @@ class ScyllaDBBackend(StoragePluginInterface):
         the loop).
 
         :param cql: The CQL text to prepare.
-        :return: A cached or newly-prepared statement with
-            ``consistency_level`` set.
+        :return: A cached or newly-prepared statement with ``consistency``
+            set.
         """
         # Lock-free read: dict.get is GIL-atomic; the lock guards only the write.
         cached = self._prepared_statements.get(cql)
@@ -786,23 +680,21 @@ class ScyllaDBBackend(StoragePluginInterface):
         ``PreparedStatement`` objects are cached client-side, keyed by CQL
         text: the driver performs a network round-trip on every
         ``Session.prepare()`` call and does not deduplicate repeated
-        identical queries itself (its own docstring warns that statements
-        "should be prepared only once"). This cache is intentionally
-        unbounded: the number of distinct CQL strings is bounded by the
-        number of distinct (model, world_size, worker_id, dtype)
-        combinations a given process handles, not by request volume.
+        identical queries itself. This cache is intentionally unbounded:
+        the number of distinct CQL strings is bounded by the number of
+        distinct (model, world_size, worker_id, dtype) combinations a
+        given process handles, not by request volume.
 
         On a cache miss, retries transient failures the same as
         :meth:`_execute` (see :meth:`_retry_async`) -- ``Session.prepare()``
         dispatches over the same connections as any other request and can
-        hit the same transient conditions. Runs the (blocking)
-        ``Session.prepare()`` call in a thread pool executor rather than
-        directly on the event loop thread, since it is a real network round
-        trip on a cache miss, not a quick local call.
+        hit the same transient conditions. ``Session.prepare()`` is
+        natively async in this driver, so unlike the old driver's blocking
+        call, no executor offload is needed here.
 
         :param cql: The CQL text to prepare.
         :return: A cached or newly-prepared statement with
-            ``consistency_level`` and ``is_idempotent`` set.
+            ``consistency`` and ``is_idempotent`` set.
         """
         # Lock-free read (see _prepare); the lock guards only the miss write.
         cached = self._prepared_statements.get(cql)
@@ -810,15 +702,15 @@ class ScyllaDBBackend(StoragePluginInterface):
             return cached
 
         async def _do_prepare() -> "PreparedStatement":
-            loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(None, self._safe_session.prepare, cql)
+            return await self._safe_session.prepare(cql)
 
         stmt = await self._retry_async(_do_prepare, "prepare")
-        stmt.consistency_level = self._consistency
+        # PreparedStatement is immutable here (unlike the old driver's
+        # in-place attribute mutation) -- with_consistency/set_is_idempotent
+        # each return a new statement, so the result must be reassigned.
         # All statements here are primary-key upserts/selects/deletes, so
-        # duplicate execution is always safe. Required for speculative
-        # execution to fire at all -- the driver checks is_idempotent.
-        stmt.is_idempotent = True
+        # duplicate execution is always safe -- hence is_idempotent=True.
+        stmt = stmt.with_consistency(self._consistency).set_is_idempotent(True)
         with self._prepared_statements_lock:
             self._prepared_statements[cql] = stmt
         return stmt
@@ -849,69 +741,43 @@ class ScyllaDBBackend(StoragePluginInterface):
         CREATE-TABLE-IF-NOT-EXISTS, primary-key-based INSERT/upsert,
         SELECT, DELETE) are safe to retry blindly.
 
-        Pure local send-buffer backpressure (``ConnectionBusy`` on every
-        host tried -- see :func:`_is_local_connection_busy`) and genuine
-        cluster-side conditions (``Unavailable``, ``ReadTimeout``, a
-        ``NoHostAvailable`` wrapping an actual host-down error, ...) are
-        tracked as two independent retry budgets with their own backoff
-        schedules, since they call for different tradeoffs: retrying local
-        backpressure doesn't add load on the cluster the way retrying a
-        genuinely struggling cluster would, so it gets a shorter initial
-        delay (``connection_busy_retry_delay``, default 10ms, doubling,
-        capped at ``connection_busy_retry_max_delay``) and a larger budget
-        (``connection_busy_max_retries``, default 10); cluster-side
-        conditions use the more conservative ``operation_retry_delay``
-        (default 50ms, doubling, capped at ``operation_retry_max_delay``)
-        and a smaller budget (``operation_max_retries``), so as to not
-        hammer an already-struggling cluster.
+        Uses a single retry budget (``operation_retry_delay``, doubling,
+        capped at ``operation_retry_max_delay``, up to ``operation_max_retries``
+        attempts) for every retryable error. The old driver's separate,
+        shorter-backoff budget for purely local send-buffer backpressure
+        (``ConnectionBusy``) has no equivalent here: this driver's flat
+        error hierarchy exposes no per-host cause the way the old driver's
+        ``NoHostAvailable.errors`` did, so that distinction is dropped.
 
         :param op: A zero-argument callable returning a fresh coroutine
             (must be callable more than once, since a coroutine object
             cannot be awaited twice).
         :param op_name: A short label used in retry log messages.
         :return: Whatever *op* returns.
-        :raises Exception: The last exception encountered, once whichever
-            budget applies to it (cluster-side or local-backpressure) is
-            exhausted.
+        :raises Exception: The last exception encountered, once the retry
+            budget is exhausted.
         """
         # Lazy: common no-error path allocates nothing.
-        cluster_budget: Optional[_RetryBudget] = None
-        busy_budget: Optional[_RetryBudget] = None
+        budget: Optional[_RetryBudget] = None
         while True:
             try:
                 return await op()
             except _RETRYABLE_EXCEPTIONS as e:
-                if _is_local_connection_busy(e):
-                    kind = "local backpressure"
-                    if busy_budget is None:
-                        busy_budget = _RetryBudget(
-                            delay=self._connection_busy_retry_delay,
-                            retries_left=self._connection_busy_max_retries,
-                            max_delay=self._connection_busy_retry_max_delay,
-                        )
-                    budget = busy_budget
-                else:
-                    kind = "cluster-side"
-                    if cluster_budget is None:
-                        cluster_budget = _RetryBudget(
-                            delay=self._operation_retry_delay,
-                            retries_left=self._operation_max_retries,
-                            max_delay=self._operation_retry_max_delay,
-                        )
-                    budget = cluster_budget
+                if budget is None:
+                    budget = _RetryBudget(
+                        delay=self._operation_retry_delay,
+                        retries_left=self._operation_max_retries,
+                        max_delay=self._operation_retry_max_delay,
+                    )
                 if budget.retries_left <= 0:
                     raise
                 retries_left = budget.retries_left
                 delay = budget.delay
-                if kind == "local backpressure":
-                    busy_budget = budget.next()
-                else:
-                    cluster_budget = budget.next()
+                budget = budget.next()
                 logger.warning(
-                    "ScyllaDB %s failed with a %s transient error, "
-                    "retrying in %.3fs (%d retries left for this class): %s",
+                    "ScyllaDB %s failed with a transient error, "
+                    "retrying in %.3fs (%d retries left): %s",
                     op_name,
-                    kind,
                     delay,
                     retries_left - 1,
                     e,
@@ -922,62 +788,35 @@ class ScyllaDBBackend(StoragePluginInterface):
         self, stmt: Any, params: Optional[Sequence[Any]] = None
     ) -> list[Any]:
         """
-        Execute a CQL statement without blocking any OS thread.
+        Execute a CQL statement and return all its result rows.
 
-        Bridges the driver's callback-based ``ResponseFuture`` (returned by
-        ``Session.execute_async``) into a real ``asyncio.Future``, so many
-        concurrent calls share the driver's own I/O reactor thread instead
-        of each consuming a dedicated thread. Multi-page result sets are
-        drained automatically (the driver pages results at
-        ``Session.default_fetch_size`` rows, 5000 by default) so results
-        are never silently truncated; see
-        https://python-driver.docs.scylladb.com/stable/query-paging.html
-        Transient failures are retried automatically (see
+        ``Session.execute()`` is natively a coroutine in this driver, so no
+        callback-to-future bridging is needed (unlike the old driver's
+        callback-based ``ResponseFuture``/``add_callbacks``). Every
+        statement this backend issues is a point lookup/upsert/delete on a
+        single partition key -- never more than one row -- so paging is
+        disabled (``paged=False``) rather than draining pages that never
+        exist. Transient failures are retried automatically (see
         :meth:`_retry_async`).
 
         :param stmt: A CQL string or prepared ``Statement``.
         :param params: Positional bind parameters, if any.
-        :return: All result rows, accumulated across pages.
+        :return: All result rows (a DDL/schema-change statement, e.g.
+            ``CREATE TABLE``, returns an empty list).
         :raises Exception: Whatever exception the driver raises for the
             query (e.g. timeouts, unavailable replicas), after retries.
         """
-        return await self._retry_async(
-            lambda: self._execute_once(stmt, params), "execute"
-        )
 
-    async def _execute_once(
-        self, stmt: Any, params: Optional[Sequence[Any]] = None
-    ) -> list[Any]:
-        """Single-attempt core of :meth:`_execute` (no retry)."""
-        loop = asyncio.get_running_loop()
-        aio_future: "asyncio.Future[list[Any]]" = loop.create_future()
-        accumulated: list[Any] = []
+        async def _do_execute() -> list[Any]:
+            result = await self._safe_session.execute(stmt, params, paged=False)
+            return list(result.iter_current_page())
 
-        driver_future = self._safe_session.execute_async(stmt, params)
-
-        def _on_page(rows: Optional[list[Any]]) -> None:
-            # DDL/schema-change statements (e.g. CREATE TABLE) deliver
-            # `None` here instead of an empty ResultSet; only SELECT-style
-            # statements deliver an iterable of rows.
-            if rows:
-                accumulated.extend(rows)
-            if driver_future.has_more_pages:
-                driver_future.start_fetching_next_page()
-            else:
-                loop.call_soon_threadsafe(_set_result, aio_future, accumulated)
-
-        def _on_error(exc: BaseException) -> None:
-            loop.call_soon_threadsafe(_set_exception, aio_future, exc)
-
-        driver_future.add_callbacks(callback=_on_page, errback=_on_error)
-        return await aio_future
+        return await self._retry_async(_do_execute, "execute")
 
     # ---- Key-level helpers ----
 
-    def _split_kv(
-        self, tensor: torch.Tensor
-    ) -> List[tuple[int, npt.NDArray[np.uint8], npt.NDArray[np.uint8]]]:
-        """Split a [2, L, T, H] tensor into per-layer (k_view, v_view) arrays.
+    def _split_kv(self, tensor: torch.Tensor) -> List[tuple[int, bytes, bytes]]:
+        """Split a [2, L, T, H] tensor into per-layer (k_blob, v_blob) bytes.
 
         Requires a contiguous tensor (as does the previous per-layer
         ``.numpy()`` path). Takes a single flat uint8 view over the whole
@@ -986,15 +825,11 @@ class ScyllaDBBackend(StoragePluginInterface):
         ``(L + i) * bytes_per_layer`` -- instead of materializing 2L
         separate tensor-slice/numpy-view objects per chunk.
 
-        Returns zero-copy numpy views, not ``bytes``. The driver's blob
-        codec (``bytes(val)``) still has to materialize real bytes
-        eventually, on the single thread that calls ``execute_async`` --
-        measured (isolated micro-benchmark, no network) to be *faster*
-        than doing those copies here on ``self._blob_executor`` and
-        passing real ``bytes`` through: spreading many per-layer memcpys
-        across several threads costs more in GIL/thread-pool contention
-        than it gains in parallelism, since each individual copy is
-        small. Keep this zero-copy unless re-measured otherwise.
+        Unlike the old driver's blob codec (which called ``bytes(val)`` on
+        whatever it was given), this driver's blob serializer only accepts
+        ``bytes`` -- an ``ndarray`` raises ``SerializationError``. So each
+        slice is materialized here via ``.tobytes()``, already off the
+        event loop (this whole method runs on ``self._blob_executor``).
         """
         layers = tensor.shape[1]
         hidden_elements = tensor.shape[2] * tensor.shape[3]
@@ -1003,17 +838,14 @@ class ScyllaDBBackend(StoragePluginInterface):
         flat = tensor.view(torch.uint8).numpy().ravel()
         # Final size is known upfront, so index-assign into a pre-sized list
         # instead of growing it one append() at a time.
-        empty = flat[:0]
-        results: list[tuple[int, npt.NDArray[np.uint8], npt.NDArray[np.uint8]]] = [
-            (0, empty, empty)
-        ] * layers
+        results: list[tuple[int, bytes, bytes]] = [(0, b"", b"")] * layers
         for layer in range(layers):
             k_off = layer * bytes_per_layer
             v_off = (layers + layer) * bytes_per_layer
             results[layer] = (
                 layer,
-                flat[k_off : k_off + bytes_per_layer],
-                flat[v_off : v_off + bytes_per_layer],
+                flat[k_off : k_off + bytes_per_layer].tobytes(),
+                flat[v_off : v_off + bytes_per_layer].tobytes(),
             )
         return results
 
@@ -1052,9 +884,9 @@ class ScyllaDBBackend(StoragePluginInterface):
             ``bytes_per_layer``.
         """
         for i, row in enumerate(rows):
-            # Session.row_factory is tuple_factory (see _connect): row[0] is
-            # k_data, row[1] is v_data -- _CQL_SELECT_ONE_LAYER's column order.
-            k_data, v_data = row[0], row[1]
+            # Default row factory is dict-of-columns: no row_factory config
+            # equivalent to the old driver's tuple_factory in this driver.
+            k_data, v_data = row["k_data"], row["v_data"]
             # Check raw byte length (O(1)) before frombuffer, which warns on bytes.
             if len(k_data) != bytes_per_layer:
                 raise ValueError(
@@ -1086,12 +918,13 @@ class ScyllaDBBackend(StoragePluginInterface):
         returned list is always layer *i*'s row, since it comes from a
         query that explicitly asked for ``layer_id = i``.
 
-        All ``num_layers`` queries share one ``asyncio.Future`` and
-        completion counter instead of each getting its own ``Task``/
-        ``Future`` pair (e.g. via ``asyncio.gather``), which is
-        measurably cheaper at this fan-out width. Each query still gets
-        its own independent two-budget retry (cluster-side vs. local
-        ``ConnectionBusy`` backpressure), matching :meth:`_retry_async`.
+        Each per-layer query goes through :meth:`_execute` (and so gets its
+        own :meth:`_retry_async` retry budget). Unlike a plain
+        ``asyncio.gather``, this stops and cancels the rest as soon as any
+        one layer reports a miss/failure, matching the old callback-based
+        code's early-exit -- this sits on the latency-critical get path
+        (see the class docstring), so a chunk that is already a known miss
+        should not still wait on its slowest sibling layer query.
 
         :param table: The CQL table name.
         :param key: The whole-chunk key being fetched (for logging only).
@@ -1100,120 +933,52 @@ class ScyllaDBBackend(StoragePluginInterface):
             exhausting retries.
         """
         stmt = await self._prepare_async(_CQL_SELECT_ONE_LAYER.format(table=table))
-        ev_loop = asyncio.get_running_loop()
-        aio_future: "asyncio.Future[Optional[list[Any]]]" = ev_loop.create_future()
         # Final size (self._num_layers) is known upfront, so index-assign
         # into a pre-sized list instead of growing it one append() at a
         # time.
         rows: list[Any] = [None] * self._num_layers
-        remaining = self._num_layers
-        failed = False
-        # Guards `remaining` and `failed`. `rows` writes are not taken
-        # under this lock, but each one happens-before its own layer's
-        # _finish_if_done() call below, which does acquire it -- so the
-        # final read of `rows`, made by whichever call observes
-        # remaining == 0, is guaranteed to see every prior layer's write.
-        # Scoped to this call: the driver's callbacks all land on its own
-        # single reactor thread anyway, so this never actually contends,
-        # but a lock shared across every concurrent fetch would be a
-        # needless cross-fetch bottleneck if that ever changed.
-        state_lock = threading.Lock()
-
-        def _finish_if_done() -> None:
-            nonlocal remaining
-            with state_lock:
-                remaining -= 1
-                # Short-circuit on the first missing/failed layer: the
-                # chunk is already unusable (the remaining in-flight
-                # callbacks then no-op against the resolved future).
-                missed = failed
-                done = remaining == 0 or missed
-            if done:
-                ev_loop.call_soon_threadsafe(
-                    _set_result, aio_future, None if missed else rows
+        tasks = {
+            asyncio.ensure_future(
+                self._execute(stmt, (key.chunk_hash, layer_id))
+            ): layer_id
+            for layer_id in range(self._num_layers)
+        }
+        pending = set(tasks)
+        try:
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED
                 )
-
-        def _dispatch(layer_id: int) -> None:
-            # Per-layer lazy budgets; created only on first error.
-            cluster_budget: Optional[_RetryBudget] = None
-            busy_budget: Optional[_RetryBudget] = None
-
-            def _on_page(page_rows: Optional[list[Any]]) -> None:
-                nonlocal failed
-                if not page_rows:
-                    logger.debug(
-                        "ScyllaDB layer %d missing for key %s; treating "
-                        "chunk as a miss",
-                        layer_id,
-                        key,
-                    )
-                    with state_lock:
-                        failed = True
-                else:
-                    rows[layer_id] = page_rows[0]
-                _finish_if_done()
-
-            def _on_error(exc: BaseException) -> None:
-                nonlocal cluster_budget, busy_budget, failed
-                if isinstance(exc, _RETRYABLE_EXCEPTIONS):
-                    if _is_local_connection_busy(exc):
-                        if busy_budget is None:
-                            busy_budget = _RetryBudget(
-                                delay=self._connection_busy_retry_delay,
-                                retries_left=self._connection_busy_max_retries,
-                                max_delay=self._connection_busy_retry_max_delay,
-                            )
-                        if busy_budget.retries_left > 0:
-                            # call_later wakes only on the loop thread;
-                            # this callback runs on the driver's reactor
-                            # thread, so hop via call_soon_threadsafe.
-                            ev_loop.call_soon_threadsafe(
-                                ev_loop.call_later,
-                                busy_budget.delay,
-                                _dispatch,
-                                layer_id,
-                            )
-                            # Consume one attempt for the local-budget class.
-                            busy_budget = busy_budget.next()
-                            return
-                    elif cluster_budget is None:
-                        cluster_budget = _RetryBudget(
-                            delay=self._operation_retry_delay,
-                            retries_left=self._operation_max_retries,
-                            max_delay=self._operation_retry_max_delay,
-                        )
-                    assert cluster_budget is not None
-                    if cluster_budget.retries_left > 0:
-                        ev_loop.call_soon_threadsafe(
-                            ev_loop.call_later,
-                            cluster_budget.delay,
-                            _dispatch,
+                for task in done:
+                    layer_id = tasks[task]
+                    exc = task.exception()
+                    if exc is not None:
+                        with self._get_blocking_failed_count_lock:
+                            self._get_blocking_failed_count += 1
+                        logger.warning(
+                            "ScyllaDB layer %d fetch failed for key %s: %s; "
+                            "treating chunk as a miss",
                             layer_id,
+                            key,
+                            exc,
                         )
-                        cluster_budget = cluster_budget.next()
-                        return
-                with self._get_blocking_failed_count_lock:
-                    self._get_blocking_failed_count += 1
-                logger.warning(
-                    "ScyllaDB layer %d fetch failed for key %s: %s; "
-                    "treating chunk as a miss",
-                    layer_id,
-                    key,
-                    exc,
-                )
-                with state_lock:
-                    failed = True
-                _finish_if_done()
-
-            driver_future = self._safe_session.execute_async(
-                stmt, (key.chunk_hash, layer_id)
-            )
-            driver_future.add_callbacks(callback=_on_page, errback=_on_error)
-
-        for layer_id in range(self._num_layers):
-            _dispatch(layer_id)
-
-        return await aio_future
+                        return None
+                    result = task.result()
+                    if not result:
+                        logger.debug(
+                            "ScyllaDB layer %d missing for key %s; "
+                            "treating chunk as a miss",
+                            layer_id,
+                            key,
+                        )
+                        return None
+                    rows[layer_id] = result[0]
+        finally:
+            if pending:
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+        return rows
 
     # ---- StorageBackendInterface methods ----
 
@@ -1423,7 +1188,11 @@ class ScyllaDBBackend(StoragePluginInterface):
             self._blob_executor, self._split_kv, tensor
         )
 
-        session_bytes_written = 0
+        # Summarize now so nothing below needs the blobs again: dropping this
+        # list lets each blob die with its own INSERT's frame instead of all
+        # 2L (32MiB/chunk) living until the slowest sibling returns.
+        layer_ids = [layer_id for layer_id, _, _ in per_layer]
+        session_bytes_written = sum(len(k) + len(v) for _, k, v in per_layer)
         tasks = [
             self._execute(
                 stmt,
@@ -1431,11 +1200,12 @@ class ScyllaDBBackend(StoragePluginInterface):
             )
             for layer_id, k_blob, v_blob in per_layer
         ]
+        del per_layer
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         failed = [
             (layer_id, exc)
-            for (layer_id, _, _), exc in zip(per_layer, results, strict=True)
+            for layer_id, exc in zip(layer_ids, results, strict=True)
             if isinstance(exc, BaseException)
         ]
         if failed:
@@ -1444,15 +1214,12 @@ class ScyllaDBBackend(StoragePluginInterface):
                 "failed (%s); rolling back the whole chunk",
                 key,
                 len(failed),
-                len(per_layer),
+                len(layer_ids),
                 failed,
             )
-            layer_ids = [layer_id for layer_id, _, _ in per_layer]
             await self._rollback_partial_write_async(key, table, layer_ids)
             return False
 
-        for _, k_blob, v_blob in per_layer:
-            session_bytes_written += len(k_blob) + len(v_blob)
         self.stats_monitor.update_interval_remote_write_metrics(session_bytes_written)
         return True
 
@@ -1551,8 +1318,8 @@ class ScyllaDBBackend(StoragePluginInterface):
                 rows = chunk_rows
                 layer_count = self._num_layers
 
-            # row[0]/row[1] = k_data/v_data (see _reconstruct_tensor).
-            first_row_k_data = rows[0][0]
+            # Default row factory is dict-of-columns (see _reconstruct_tensor).
+            first_row_k_data = rows[0]["k_data"]
             # Size from byte length directly; avoids a frombuffer (and its warning).
             num_elements = len(first_row_k_data) // element_size
             num_tokens = num_elements // self._hidden_dim
@@ -1574,13 +1341,16 @@ class ScyllaDBBackend(StoragePluginInterface):
 
                 if isinstance(key, LayerCacheEngineKey):
                     k_u8 = torch.frombuffer(first_row_k_data, dtype=torch.uint8)
-                    v_bytes = torch.frombuffer(rows[0][1], dtype=torch.uint8)
+                    v_bytes = torch.frombuffer(rows[0]["v_data"], dtype=torch.uint8)
                     offset = num_tokens * self._hidden_dim * element_size
                     target_u8[:offset].copy_(k_u8)
                     target_u8[offset : offset + len(v_bytes)].copy_(v_bytes)
                 else:
-                    # Offload the copies: keeps the loop free to drain CQL
-                    # callbacks; copy_() releases the GIL so they overlap.
+                    # Offload the copies so the loop stays free to drain CQL
+                    # completions. This does NOT run in parallel with other
+                    # chunks' copies -- copy_() holds the GIL for its whole
+                    # memcpy (measured) -- it only keeps the blocking memcpy
+                    # off the event loop thread.
                     bytes_per_layer = num_tokens * self._hidden_dim * element_size
                     loop = asyncio.get_running_loop()
                     await loop.run_in_executor(
@@ -1591,6 +1361,10 @@ class ScyllaDBBackend(StoragePluginInterface):
                         layer_count,
                         bytes_per_layer,
                     )
+                    # Copied out: drop the driver's row blobs (32MiB/chunk)
+                    # now instead of holding them to coroutine exit.
+                    rows = []
+                    del chunk_rows
             except Exception:
                 # Release the pool-allocated object on failure so reconstruction
                 # errors don't leak it and silently shrink the bounded pool.
@@ -1860,7 +1634,7 @@ class ScyllaDBBackend(StoragePluginInterface):
         """
         Close the backend, waiting up to ``timeout_secs`` for pending put
         tasks and in-flight gets to finish before releasing the ScyllaDB
-        session/cluster.
+        session.
 
         If the wait times out with puts or gets still in flight, those
         operations are abandoned (a put's rows may be partially or fully
